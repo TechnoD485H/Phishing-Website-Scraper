@@ -25,6 +25,8 @@ if __name__ == '__main__':
     car_titles = get_car_titles(url)
     print(car_titles)
 
+    alltitles =[]
+
     # if soup:
     #     print(soup.a.title)  # just print the page title, not the whole HTML dump
 
