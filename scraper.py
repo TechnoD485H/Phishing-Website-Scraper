@@ -1,4 +1,5 @@
 import requests
+import csv
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -15,13 +16,13 @@ SITE_CONFIGS = {
         "title_class": None,
         "num_pages": 17,
     },
-    "books_toscrape": {
-        "base_url": "https://books.toscrape.com/catalogue/page-{page}.html",
-        "pagination_type": "path",          # e.g. /page-2.html
-        "title_tag": "h3",
-        "title_class": None,
-        "num_pages": 50,
-    },
+    # "books_toscrape": {
+    #     "base_url": "https://books.toscrape.com/catalogue/page-{page}.html",
+    #     "pagination_type": "path",          # e.g. /page-2.html
+    #     "title_tag": "h3",
+    #     "title_class": None,
+    #     "num_pages": 50,
+    # },
 }
 
 
@@ -55,6 +56,11 @@ def scrape_site(config, max_workers=5):
     all_titles = []
 
     with requests.Session() as session:
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/124.0 Safari/537.36"
+        })
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_url = {
                 executor.submit(
@@ -69,9 +75,21 @@ def scrape_site(config, max_workers=5):
     return all_titles
 
 
+def save_to_csv(titles, filename='titles.csv'):
+    """Writes a list of titles to a CSV file, one per row under a 'title' header."""
+    with open(filename, mode='w', newline='', encoding='utf-8') as file:
+        writer = csv.writer(file)
+        writer.writerow(["title"])
+        for title in titles:
+            writer.writerow([title])
+    print(f"Saved {len(titles)} titles to {filename}")
+
+
 if __name__ == '__main__':
     car_titles = scrape_site(SITE_CONFIGS["webscraper_test"])
-    print(car_titles[:5])
+    car_titles.sort()
+    save_to_csv(car_titles, "car_titles.csv")
+    print(car_titles)
 
-    book_titles = scrape_site(SITE_CONFIGS["books_toscrape"])
-    print(book_titles[:5])
+    # book_titles = scrape_site(SITE_CONFIGS["books_toscrape"])
+    # print(book_titles[:5])
