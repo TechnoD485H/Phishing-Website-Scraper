@@ -91,5 +91,6 @@ if __name__ == '__main__':
     save_to_csv(car_titles, "car_titles.csv")
     print(car_titles)
 
+    #test
     # book_titles = scrape_site(SITE_CONFIGS["books_toscrape"])
     # print(book_titles[:5])
