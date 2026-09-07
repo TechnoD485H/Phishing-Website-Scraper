@@ -72,14 +72,14 @@ def scrape_site(config, max_workers=5):
                 all_titles.extend(future.result())
 
     print(f"[{config['base_url']}] Total items collected: {len(all_titles)}")
-    return all_titles
+    return all_titles  
 
 
 def save_to_csv(titles, filename='titles.csv'):
     """Writes a list of titles to a CSV file, one per row under a 'title' header."""
     with open(filename, mode='w', newline='', encoding='utf-8') as file:
         writer = csv.writer(file)
-        writer.writerow(["title"])
+        writer.writerow(["cars"])
         for title in titles:
             writer.writerow([title])
     print(f"Saved {len(titles)} titles to {filename}")
@@ -93,4 +93,4 @@ if __name__ == '__main__':
 
     #test
     # book_titles = scrape_site(SITE_CONFIGS["books_toscrape"])
-    # print(book_titles[:5])
+    # print(book_titles[:5]) 
