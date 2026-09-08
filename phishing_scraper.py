@@ -11,106 +11,15 @@ except ImportError:
     whois = None
     print("Note: python-whois not installed. Run 'pip install python-whois' to enable domain-age checks.")
 
-
-# ---------------------------------------------------------
-# SITE CONFIGS — describe each site's structure here.
-# Adding a new site = adding an entry, no new code needed.
-# (Used for the generic pagination scraper below, e.g. the
-# car-titles demo. NOT used for phishing feature extraction.)
-# ---------------------------------------------------------
-SITE_CONFIGS = {
-    "webscraper_test": {
-        "base_url": "https://webscraper.io/test-sites/pagination",
-        "pagination_type": "query_param",   # e.g. ?page=2
-        "page_param": "page",
-        "title_tag": "h3",
-        "title_class": None,
-        "num_pages": 17,
-    },
-    # "books_toscrape": {
-    #     "base_url": "https://books.toscrape.com/catalogue/page-{page}.html",
-    #     "pagination_type": "path",          # e.g. /page-2.html
-    #     "title_tag": "h3",
-    #     "title_class": None,
-    #     "num_pages": 50,
-    # },
-}
+try:
+    import pandas as pd  
+except ImportError:
+    pd = None
+    print("Note: pandas not installed. Run 'pip install pandas openpyxl' to enable Excel export.")
 
 
 # ===========================================================
-# PART 1: GENERIC PAGINATION SCRAPER (your existing project)
-# ===========================================================
-
-def build_page_url(config, page):
-    """Builds the correct URL for a given page, based on the site's pagination style."""
-    if config["pagination_type"] == "query_param":
-        return f"{config['base_url']}?{config['page_param']}={page}"
-    elif config["pagination_type"] == "path":
-        return config["base_url"].format(page=page)
-    else:
-        raise ValueError(f"Unknown pagination_type: {config['pagination_type']}")
-
-
-def get_titles(session, url, tag, css_class=None, timeout=5):
-    """Fetches one page and extracts text from all matching elements."""
-    try:
-        response = session.get(url, timeout=timeout)
-        response.raise_for_status()
-    except requests.RequestException as e:
-        print(f"Could not fetch {url}: {e}")
-        return []
-
-    soup = BeautifulSoup(response.text, 'html.parser')
-    elements = soup.find_all(tag, class_=css_class) if css_class else soup.find_all(tag)
-    return [el.get_text(strip=True) for el in elements]
-
-
-def scrape_site(config, max_workers=5):
-    """Generic engine: reads a config, scrapes every page, returns all titles."""
-    urls = [build_page_url(config, page) for page in range(1, config["num_pages"] + 1)]
-    all_titles = []
-
-    with requests.Session() as session:
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/124.0 Safari/537.36"
-        })
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_url = {
-                executor.submit(
-                    get_titles, session, url, config["title_tag"], config["title_class"]
-                ): url
-                for url in urls
-            }
-            for future in as_completed(future_to_url):
-                all_titles.extend(future.result())
-
-    print(f"[{config['base_url']}] Total items collected: {len(all_titles)}")
-    return all_titles
-
-
-def save_to_csv(rows, filename='titles.csv', fieldnames=None):
-    """
-    Writes rows to CSV.
-    - If rows are plain strings (e.g. titles), writes them under a single 'title' column.
-    - If rows are dicts (e.g. phishing features), writes them as a proper table using fieldnames.
-    """
-    with open(filename, mode='w', newline='', encoding='utf-8') as file:
-        if rows and isinstance(rows[0], dict):
-            writer = csv.DictWriter(file, fieldnames=fieldnames or list(rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(rows)
-        else:
-            writer = csv.writer(file)
-            writer.writerow(["title"])
-            for row in rows:
-                writer.writerow([row])
-    print(f"Saved {len(rows)} rows to {filename}")
-
-
-# ===========================================================
-# PART 2: PHISHING FEATURE EXTRACTION (new)
+# PHISHING FEATURE EXTRACTION
 # ===========================================================
 
 def fetch_page(session, url, timeout=5):
@@ -233,18 +142,41 @@ def analyze_urls(urls, max_workers=5):
     return results
 
 
-if __name__ == '__main__':
-    # --- Part 1 demo: generic pagination scraper (unchanged from before) ---
-    car_titles = scrape_site(SITE_CONFIGS["webscraper_test"])
-    car_titles.sort()
-    save_to_csv(car_titles, "car_titles.csv")
-    print(car_titles)
+# ===========================================================
+# EXPORT
+# ===========================================================
 
-    # --- Part 2 demo: phishing feature extraction on a handful of test URLs ---
+def save_to_csv(rows, filename='phishing_features.csv', fieldnames=None):
+    """Writes a list of feature dicts to a CSV file as a proper table."""
+    if not rows:
+        print("No rows to save.")
+        return
+    with open(filename, mode='w', newline='', encoding='utf-8') as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames or list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Saved {len(rows)} rows to {filename}")
+
+
+def save_to_excel(rows, filename='phishing_features.xlsx'):
+    """Writes a list of feature dicts to an Excel file as a proper table."""
+    if not rows:
+        print("No rows to save.")
+        return
+    if pd is None:
+        print("pandas not installed — skipping Excel export. Run 'pip install pandas openpyxl'.")
+        return
+    df = pd.DataFrame(rows)
+    df.to_excel(filename, index=False)  # index=False avoids an extra row-number column
+    print(f"Saved {len(rows)} rows to {filename}")
+
+
+if __name__ == '__main__':
     # Replace these with real examples later (e.g. from PhishTank / UCI dataset)
     test_urls = [
         "https://www.google.com",
         "https://www.python.org",
+        "http://192.168.1.1/login"
     ]
 
     results = analyze_urls(test_urls)
@@ -252,3 +184,4 @@ if __name__ == '__main__':
         print(r)
 
     save_to_csv(results, "phishing_features.csv")
+    save_to_excel(results, "phishing_features.xlsx")

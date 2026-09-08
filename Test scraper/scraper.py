@@ -1,5 +1,6 @@
 import requests
 import csv
+import pandas
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 

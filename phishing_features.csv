@@ -1,3 +1,4 @@
 url,url_length,num_dots,num_hyphens,has_at_symbol,uses_https,has_ip_as_domain,num_forms,has_password_field,form_posts_externally,domain_age_days,risk_score
 https://www.python.org,22,2,0,False,True,False,1,False,False,,0
 https://www.google.com,22,2,0,False,True,False,1,False,False,,0
+http://192.168.1.1/login,24,3,0,False,False,True,0,False,False,,3
