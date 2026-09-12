@@ -1,12 +1,8 @@
 """
-train_model.py
+Trains a classifier on labeled_dataset.csv (produced by phishing_detector.py)
+and compares it against the hand-built rule_based_score() baseline.
 
-Trains a machine-learning classifier on the labeled dataset produced by
-phishing_detector.py (labeled_dataset.csv), and compares its performance
-against the hand-built rule_based_score() baseline.
-
-Run phishing_detector.py FIRST to generate labeled_dataset.csv, then run
-this script.
+Run phishing_detector.py first to generate the dataset, then run this.
 """
 
 import pandas as pd
@@ -29,15 +25,12 @@ FEATURE_COLUMNS = [
     'has_password_field',
     'form_posts_externally',
 ]
-# Note: domain_age_days is deliberately excluded by default — it's very
-# often missing (None) for phishing URLs on free hosting or with WHOIS
-# privacy, and scikit-learn's RandomForestClassifier can't handle NaN
-# directly. If you want to include it, fill missing values first
-# (e.g. df['domain_age_days'].fillna(-1)) before adding it to this list.
+# domain_age_days is left out on purpose — it's often missing for phishing
+# URLs (free hosting, WHOIS privacy), and scikit-learn can't handle NaN
+# directly. Fill it with a placeholder like -1 first if you want to try it.
 
 
 def load_dataset(filename='labeled_dataset.csv'):
-    """Loads the labeled dataset produced by phishing_detector.py."""
     df = pd.read_csv(filename)
     missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
     if missing:
@@ -46,10 +39,6 @@ def load_dataset(filename='labeled_dataset.csv'):
 
 
 def train_and_evaluate(df, test_size=0.3, random_state=42):
-    """
-    Splits the data, trains a RandomForestClassifier, and prints an
-    evaluation report. Returns the trained model.
-    """
     X = df[FEATURE_COLUMNS]
     y = df['label']
 
@@ -57,10 +46,9 @@ def train_and_evaluate(df, test_size=0.3, random_state=42):
 
     if len(df) < 20:
         print(
-            "\nWarning: this dataset is quite small for ML training. "
-            "Results below are illustrative, not statistically reliable — "
-            "increase the OpenPhish limit in phishing_detector.py and re-run "
-            "to collect more data before trusting these numbers."
+            "\nHeads up — this dataset is pretty small for ML. Treat these "
+            "numbers as a first look, not a reliable result. Bump up the "
+            "OpenPhish limit in phishing_detector.py and re-run to get more data."
         )
 
     X_train, X_test, y_train, y_test = train_test_split(
@@ -72,7 +60,7 @@ def train_and_evaluate(df, test_size=0.3, random_state=42):
 
     y_pred = model.predict(X_test)
 
-    print("\n--- Classifier evaluation (on held-out test set) ---")
+    print("\n--- How the model did on the test set ---")
     print(classification_report(y_test, y_pred, target_names=['legit', 'phishing']))
 
     print("Confusion matrix (rows = actual, cols = predicted):")
@@ -82,7 +70,7 @@ def train_and_evaluate(df, test_size=0.3, random_state=42):
         columns=['pred: legit', 'pred: phishing']
     ))
 
-    print("\n--- Feature importance (which signals the model relied on most) ---")
+    print("\n--- Which features the model leaned on most ---")
     importances = pd.Series(model.feature_importances_, index=FEATURE_COLUMNS)
     print(importances.sort_values(ascending=False).round(3))
 
@@ -90,15 +78,11 @@ def train_and_evaluate(df, test_size=0.3, random_state=42):
 
 
 def compare_to_rule_based_baseline(df, threshold=5):
-    """
-    Evaluates how well the existing rule_based_score() alone would have
-    classified the same data, using a simple threshold. This is the
-    baseline the ML model should ideally beat.
-    """
+    """How well would the original point-based scorer alone have done?"""
     predicted = (df['risk_score'] >= threshold).astype(int)
     actual = df['label']
 
-    print(f"\n--- Rule-based baseline (risk_score >= {threshold} => phishing) ---")
+    print(f"\n--- Rule-based baseline (risk_score >= {threshold} = phishing) ---")
     print(classification_report(actual, predicted, target_names=['legit', 'phishing']))
 
 
@@ -111,10 +95,10 @@ if __name__ == '__main__':
     compare_to_rule_based_baseline(df)
 
     print("\n" + "=" * 70)
-    print("MACHINE LEARNING MODEL (RandomForestClassifier)")
+    print("MACHINE LEARNING MODEL")
     print("=" * 70)
     model, X_test, y_test = train_and_evaluate(df)
 
     joblib.dump(model, 'phishing_model.joblib')
-    print("\nSaved trained model to phishing_model.joblib")
+    print("\nModel saved to phishing_model.joblib")
     print("Load it later with: model = joblib.load('phishing_model.joblib')")

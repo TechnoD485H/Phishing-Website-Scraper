@@ -12,21 +12,21 @@ try:
     import whois  # pip install python-whois
 except ImportError:
     whois = None
-    print("Note: python-whois not installed. Run 'pip install python-whois' to enable domain-age checks.")
+    print("python-whois not installed — domain-age checks will be skipped. (pip install python-whois)")
 
 try:
     import pandas as pd  # pip install pandas openpyxl
 except ImportError:
     pd = None
-    print("Note: pandas not installed. Run 'pip install pandas openpyxl' to enable Excel export.")
+    print("pandas not installed — Excel export will be skipped. (pip install pandas openpyxl)")
 
 
-# ===========================================================
-# TEST DATA SOURCES
-# ===========================================================
+# ---------------------------------------------------------
+# Where our test data comes from
+# ---------------------------------------------------------
 
 def load_openphish_urls(limit=10, timeout=10):
-    """Downloads the free OpenPhish community feed (no registration needed)."""
+    """Grabs a batch of currently-active phishing URLs from OpenPhish's free feed."""
     try:
         response = requests.get("https://openphish.com/feed.txt", timeout=timeout)
         response.raise_for_status()
@@ -72,18 +72,12 @@ LEGIT_TEST_URLS = [
 ]
 
 
-# ===========================================================
-# SAFETY: BLOCK PRIVATE / INTERNAL IP TARGETS
-# ===========================================================
-# Feeds of "wild" URLs (like OpenPhish) occasionally include entries that
-# point at private/internal IP ranges (e.g. 192.168.x.x, 10.x.x.x,
-# 127.0.0.1). Fetching those blindly means your scraper could end up
-# probing YOUR OWN network (router admin pages, local services, etc.)
-# instead of the intended external target. We check and refuse before
-# ever making the request.
+# ---------------------------------------------------------
+# Safety: don't let the scraper touch private/internal IPs
+# ---------------------------------------------------------
 
 def is_private_or_local(url):
-    """Returns True if the URL's hostname is a private, loopback, or link-local IP address."""
+    """True if a URL points at a private/loopback/internal IP (e.g. your own router)."""
     hostname = urlparse(url).hostname
     if not hostname:
         return True
@@ -91,39 +85,32 @@ def is_private_or_local(url):
         ip = ipaddress.ip_address(hostname)
         return ip.is_private or ip.is_loopback or ip.is_link_local
     except ValueError:
-        return False  # it's a domain name, not a raw IP — fine to proceed
+        return False  # it's a normal domain name, not a raw IP
 
 
-# ===========================================================
-# SAFETY: NEUTRALIZE SPREADSHEET FORMULA INJECTION
-# ===========================================================
-# If a scraped string starts with =, +, -, or @, Excel/Numbers/Sheets can
-# interpret it as a formula when the file is later opened — a known
-# technique for smuggling a payload into "data". Since our feature values
-# are sourced from untrusted, attacker-controlled pages, every string
-# value gets sanitized before it's written to CSV or Excel.
+# ---------------------------------------------------------
+# Safety: stop scraped text from becoming an Excel formula
+# ---------------------------------------------------------
 
 def sanitize_for_spreadsheet(value):
-    """Prefixes a leading =, +, -, or @ with a single quote so spreadsheet apps treat it as plain text."""
+    """Neutralizes strings that start with =, +, -, or @ so they can't run as formulas."""
     if isinstance(value, str) and value and value[0] in ('=', '+', '-', '@'):
         return "'" + value
     return value
 
 
 def sanitize_row(row):
-    """Applies sanitize_for_spreadsheet() to every value in a feature dict."""
     return {key: sanitize_for_spreadsheet(value) for key, value in row.items()}
 
 
-# ===========================================================
-# FREE-HOSTING / PaaS DETECTION
-# ===========================================================
-# Phishing kits frequently get hosted on free subdomains of legitimate
-# platforms (Weebly, Cloudflare Pages, GitBook, Azure Front Door, etc.).
-# Being hosted on one of these — especially with a random-looking
-# subdomain — is itself a strong red flag, independent of domain age,
-# since the PLATFORM's domain age tells you nothing about the attacker's
-# specific page.
+# ---------------------------------------------------------
+# Free-hosting detection
+# ---------------------------------------------------------
+# A lot of phishing pages live on free subdomains of real platforms
+# (Weebly, Azure, GitBook, etc.) — being hosted there is a red flag
+# on its own, since the platform's age doesn't tell you anything
+# about how old the attacker's specific page actually is.
+
 FREE_HOSTING_DOMAINS = [
     'weebly.com', 'pages.dev', 'gitbook.io', 'azurefd.net',
     'cloudclusters.net', 'amplifyapp.com', 'godaddysites.com',
@@ -134,35 +121,23 @@ FREE_HOSTING_DOMAINS = [
 
 
 def is_on_free_hosting(url):
-    """Returns True if the URL's hostname is a subdomain of a known free-hosting platform."""
     hostname = urlparse(url).hostname or ''
     return any(hostname == d or hostname.endswith('.' + d) for d in FREE_HOSTING_DOMAINS)
 
 
-# ===========================================================
-# SUBDOMAIN ENTROPY
-# ===========================================================
-# Automated phishing kits often generate random-looking subdomains
-# (e.g. "3ib64a1sok-k9t7f7se-evaygbgad7dueuhq") rather than human-chosen
-# names. Shannon entropy measures how "random" a string looks — higher
-# entropy = less like a real word, more like an autogenerated string.
+# ---------------------------------------------------------
+# Subdomain entropy — how "random" does the subdomain look?
+# ---------------------------------------------------------
+# Phishing kits often auto-generate subdomains like
+# "3ib64a1sok-k9t7f7se-evaygbgad7dueuhq". Shannon entropy gives us
+# a number for how random a string looks — real words score low,
+# generated gibberish scores high.
 
 def subdomain_entropy(url):
-    """
-    Calculates the Shannon entropy of the attacker-controlled part of a URL's hostname.
-
-    On free-hosting platforms, the interesting part is everything BEFORE
-    the platform's own domain — so we strip the known suffix first.
-    Without this, a naive "first label" approach would measure "www"
-    (near-zero entropy, useless) instead of the actual attacker-chosen
-    string.
-
-    On regular domains, we fall back to just the first label (typical
-    subdomain position), since we don't have a public-suffix list here
-    to reliably find the registrable domain boundary.
-    """
     hostname = urlparse(url).hostname or ''
 
+    # on free hosting, strip the platform's own domain first so we're
+    # measuring the attacker's chosen name, not "www"
     matched_base = next(
         (base for base in FREE_HOSTING_DOMAINS
          if hostname == base or hostname.endswith('.' + base)),
@@ -184,14 +159,14 @@ def subdomain_entropy(url):
     return -sum((count / length) * math.log2(count / length) for count in counts.values())
 
 
-# ===========================================================
-# PHISHING FEATURE EXTRACTION
-# ===========================================================
+# ---------------------------------------------------------
+# Core pipeline: fetch -> extract features -> score
+# ---------------------------------------------------------
 
 def fetch_page(session, url, timeout=5):
-    """Fetches and parses a single URL. Returns a BeautifulSoup object, or None on failure/unsafe target."""
+    """Fetches and parses a page. Returns None if it's unreachable, or points somewhere unsafe."""
     if is_private_or_local(url):
-        print(f"Skipping {url}: points to a private/internal address")
+        print(f"Skipping {url} — points to a private/internal address")
         return None
 
     try:
@@ -204,14 +179,10 @@ def fetch_page(session, url, timeout=5):
 
 
 def extract_features(url, soup):
-    """
-    Pulls measurable red-flag signals out of a URL + its parsed page.
-    Returns a dict of features suitable for scoring or ML training.
-    """
+    """Pulls out the signals we use to judge whether a page looks like phishing."""
     parsed = urlparse(url)
     features = {"url": url}
 
-    # --- URL-based signals ---
     features['url_length'] = len(url)
     features['num_dots'] = url.count('.')
     features['num_hyphens'] = url.count('-')
@@ -223,12 +194,12 @@ def extract_features(url, soup):
     features['on_free_hosting'] = is_on_free_hosting(url)
     features['subdomain_entropy'] = round(subdomain_entropy(url), 2)
 
-    # --- Page content signals (only meaningful if the page actually loaded) ---
     if soup:
         forms = soup.find_all('form')
         features['num_forms'] = len(forms)
         features['has_password_field'] = bool(soup.find('input', {'type': 'password'}))
 
+        # does any form send its data to a different domain than the page itself?
         external_form = False
         for form in forms:
             action = form.get('action', '')
@@ -244,10 +215,8 @@ def extract_features(url, soup):
 
 
 def get_domain_age_days(url):
-    """Looks up how old a domain is via WHOIS. Returns None if lookup fails or whois isn't installed."""
-    if whois is None:
-        return None
-    if is_private_or_local(url):
+    """How old is this domain, according to WHOIS? Returns None if we can't tell."""
+    if whois is None or is_private_or_local(url):
         return None
     try:
         domain = urlparse(url).netloc
@@ -256,10 +225,7 @@ def get_domain_age_days(url):
         if isinstance(creation_date, list):
             creation_date = creation_date[0]
         if creation_date:
-            # Some WHOIS servers return a timezone-aware datetime, others return
-            # a naive one. datetime.now() is always naive, so mixing the two
-            # raises "can't subtract offset-naive and offset-aware datetimes".
-            # Stripping tzinfo here normalizes both cases before subtracting.
+            # WHOIS servers are inconsistent about timezones — normalize before subtracting
             if creation_date.tzinfo is not None:
                 creation_date = creation_date.replace(tzinfo=None)
             return (datetime.now() - creation_date).days
@@ -269,15 +235,7 @@ def get_domain_age_days(url):
 
 
 def rule_based_score(features, domain_age_days):
-    """
-    Simple point-based phishing likelihood score. Higher = more suspicious.
-
-    Domain age is only trusted as a "this looks safe" signal when the site
-    is NOT on a known free-hosting platform. On free hosting, the
-    platform's own age is meaningless — what matters is that free hosting
-    + a suspicious-looking subdomain is being used to impersonate
-    something at all.
-    """
+    """Simple point system — higher means more suspicious. Our v1 baseline before ML."""
     score = 0
 
     if not features['uses_https']:
@@ -295,6 +253,8 @@ def rule_based_score(features, domain_age_days):
     if features['subdomain_entropy'] >= 3.5:
         score += 3
 
+    # only trust "old domain = safe" off free hosting — on free hosting,
+    # the platform's age isn't the attacker's age
     if not features['on_free_hosting']:
         if domain_age_days is not None and domain_age_days < 30:
             score += 3
@@ -303,7 +263,6 @@ def rule_based_score(features, domain_age_days):
 
 
 def analyze_url(session, url):
-    """Full pipeline for one URL: fetch -> extract features -> domain age -> score."""
     soup = fetch_page(session, url)
     features = extract_features(url, soup)
     domain_age_days = get_domain_age_days(url)
@@ -315,7 +274,7 @@ def analyze_url(session, url):
 
 
 def analyze_urls(urls, max_workers=5):
-    """Runs analyze_url() across a list of URLs concurrently, returns a list of feature dicts."""
+    """Runs analyze_url() across a list of URLs at once."""
     results = []
     with requests.Session() as session:
         session.headers.update({
@@ -334,20 +293,13 @@ def analyze_urls(urls, max_workers=5):
     return results
 
 
-# ===========================================================
-# LABELED DATASET BUILDER (for ML training)
-# ===========================================================
+# ---------------------------------------------------------
+# Building a labeled dataset (for training the ML model later)
+# ---------------------------------------------------------
 
 def build_labeled_dataset(phishing_urls, legit_urls, max_workers=5):
-    """
-    Runs the full analysis pipeline across both known-phishing and
-    known-legit URLs, and stamps each result with a 'label' column
-    (1 = phishing, 0 = legit). This labeled table is what gets used
-    to train a classifier later — the ground truth comes from which
-    list each URL was sourced from, not from the rule_based_score.
-    """
+    """Runs everything and tags each row 1 (phishing) or 0 (legit) based on its source list."""
     phishing_set = set(phishing_urls)
-
     all_urls = list(phishing_urls) + list(legit_urls)
     results = analyze_urls(all_urls, max_workers=max_workers)
 
@@ -357,12 +309,11 @@ def build_labeled_dataset(phishing_urls, legit_urls, max_workers=5):
     return results
 
 
-# ===========================================================
-# EXPORT
-# ===========================================================
+# ---------------------------------------------------------
+# Export
+# ---------------------------------------------------------
 
 def save_to_csv(rows, filename='phishing_features.csv', fieldnames=None):
-    """Writes a list of feature dicts to a CSV file as a proper table, sanitized against formula injection."""
     if not rows:
         print("No rows to save.")
         return
@@ -375,12 +326,11 @@ def save_to_csv(rows, filename='phishing_features.csv', fieldnames=None):
 
 
 def save_to_excel(rows, filename='phishing_features.xlsx'):
-    """Writes a list of feature dicts to an Excel file as a proper table, sanitized against formula injection."""
     if not rows:
         print("No rows to save.")
         return
     if pd is None:
-        print("pandas not installed — skipping Excel export. Run 'pip install pandas openpyxl'.")
+        print("pandas isn't installed, so I can't write Excel files. (pip install pandas openpyxl)")
         return
     sanitized_rows = [sanitize_row(row) for row in rows]
     df = pd.DataFrame(sanitized_rows)
@@ -389,14 +339,11 @@ def save_to_excel(rows, filename='phishing_features.xlsx'):
 
 
 if __name__ == '__main__':
-    # Bumped from 10 -> 60: a handful of URLs was enough to sanity-check the
-    # pipeline and catch feature bugs (which it did), but is too small a
-    # sample to draw real conclusions from or use as ML training data.
     phishing_urls = load_openphish_urls(limit=60)
-    print(f"Loaded {len(phishing_urls)} URLs from OpenPhish feed")
+    print(f"Loaded {len(phishing_urls)} URLs from OpenPhish")
 
     legit_urls = LEGIT_TEST_URLS
-    print(f"Using {len(legit_urls)} known-legitimate URLs")
+    print(f"Using {len(legit_urls)} known-legit URLs")
 
     dataset = build_labeled_dataset(phishing_urls, legit_urls)
 
@@ -406,16 +353,12 @@ if __name__ == '__main__':
         label = "PHISHING" if r['label'] == 1 else "LEGIT"
         print(f"{label:10} | {r['risk_score']:5} | {r['url']}")
 
-    # Quick sanity check: does the rule-based score actually separate
-    # the two classes on average? This is the same check we did by eye
-    # on the small sample, now automated across the full batch.
     phishing_scores = [r['risk_score'] for r in dataset if r['label'] == 1]
     legit_scores = [r['risk_score'] for r in dataset if r['label'] == 0]
     if phishing_scores and legit_scores:
         avg_phishing = sum(phishing_scores) / len(phishing_scores)
         avg_legit = sum(legit_scores) / len(legit_scores)
-        print(f"\nAvg risk_score — phishing: {avg_phishing:.2f} | legit: {avg_legit:.2f}")
+        print(f"\nAverage risk score — phishing: {avg_phishing:.2f} | legit: {avg_legit:.2f}")
 
-    # This labeled file is the one to feed into train_model.py
     save_to_csv(dataset, "labeled_dataset.csv")
     save_to_excel(dataset, "labeled_dataset.xlsx")
