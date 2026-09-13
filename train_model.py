@@ -74,6 +74,16 @@ def train_and_evaluate(df, test_size=0.3, random_state=42):
     importances = pd.Series(model.feature_importances_, index=FEATURE_COLUMNS)
     print(importances.sort_values(ascending=False).round(3))
 
+    print("\n--- Any URLs the model got wrong ---")
+    mismatched = y_test.index[y_test.values != y_pred]
+    if len(mismatched) == 0:
+        print("None — perfect score on the test set.")
+    else:
+        for idx in mismatched:
+            actual_label = "phishing" if y_test.loc[idx] == 1 else "legit"
+            predicted_label = "phishing" if y_pred[list(y_test.index).index(idx)] == 1 else "legit"
+            print(f"  {df.loc[idx, 'url']}  (actual: {actual_label}, predicted: {predicted_label})")
+
     return model, X_test, y_test
 
 
