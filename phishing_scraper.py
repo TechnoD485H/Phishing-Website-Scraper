@@ -226,12 +226,18 @@ def extract_features(url, soup):
         features['num_forms'] = len(forms)
         features['has_password_field'] = bool(soup.find('input', {'type': 'password'}))
 
-        # does any form send its data somewhere other than this page's own domain?
+        # does any form send its data to a genuinely different site?
+        # compare registrable domains, not exact hostnames — a form
+        # going from www.example.com to accounts.example.com is the
+        # same real site, not a red flag
+        page_domain = get_registrable_domain(parsed.netloc)
         external_form = False
         for form in forms:
             action = form.get('action', '')
-            if action.startswith('http') and parsed.netloc not in action:
-                external_form = True
+            if action.startswith('http'):
+                action_domain = get_registrable_domain(urlparse(action).netloc)
+                if action_domain != page_domain:
+                    external_form = True
         features['form_posts_externally'] = external_form
     else:
         features['num_forms'] = 0
