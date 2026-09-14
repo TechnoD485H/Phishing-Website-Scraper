@@ -20,6 +20,8 @@ FEATURE_COLUMNS = [
     'uses_https',
     'has_ip_as_domain',
     'on_free_hosting',
+    'has_suspicious_keyword',
+    'subdomain_length',
     'subdomain_entropy',
     'num_forms',
     'has_password_field',
@@ -45,6 +47,12 @@ def load_dataset(filename='labeled_dataset.csv'):
         df['fetch_succeeded'] = 1
     if 'domain_age_known' not in df.columns:
         df['domain_age_known'] = (df['domain_age_days'] != -1).astype(int)
+    if 'has_suspicious_keyword' not in df.columns:
+        df['has_suspicious_keyword'] = 0
+    if 'subdomain_length' not in df.columns:
+        df['subdomain_length'] = df['url'].map(
+            lambda u: len((u.split('//')[-1].split('/')[0].split('.') or [''])[0])
+        )
 
     return df
 
@@ -100,12 +108,14 @@ def train_and_evaluate(df, test_size=0.3, random_state=42):
         for idx in mismatched.index:
             actual_label = "phishing" if y_test.loc[idx] == 1 else "legit"
             predicted_label = "phishing" if y_pred_series.loc[idx] == 1 else "legit"
+            reasons = df.loc[idx, 'risk_reasons'] if 'risk_reasons' in df.columns else 'n/a'
             print(f"  {df.loc[idx, 'url']}  (actual: {actual_label}, predicted: {predicted_label})")
+            print(f"      rule-based reasons: {reasons}")
 
     return model, X_test, y_test, y_pred
 
 
-def compare_to_rule_based_baseline(df_test, threshold=5):
+def compare_to_rule_based_baseline(df_test, threshold=4):
     """Scores the old point-based system on the SAME test rows the model saw,
     so the comparison is fair."""
     predicted = (df_test['risk_score'] >= threshold).astype(int)

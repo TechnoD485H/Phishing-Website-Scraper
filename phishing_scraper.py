@@ -164,18 +164,23 @@ FREE_HOSTING_DOMAINS = [
     'blogspot.com', 'sites.google.com', 'repl.co', 'glitch.me',
 ]
 
+# Classic bait words phishing URLs dangle in paths and subdomains.
+SUSPICIOUS_KEYWORDS = [
+    'login', 'verify', 'secure', 'account', 'update',
+    'confirm', 'banking', 'signin', 'support', 'wallet',
+]
+
 
 def is_on_free_hosting(url):
     hostname = urlparse(url).hostname or ''
     return any(hostname == d or hostname.endswith('.' + d) for d in FREE_HOSTING_DOMAINS)
 
 
-def subdomain_entropy(url):
-    """Scores how random the subdomain looks. Phishing kits generate junk like
-    '3ib64a1sok-k9t7f7se' — real words score low, gibberish scores high."""
+def split_subdomain_target(url):
+    """Returns the part of the hostname the attacker actually chose — what's
+    left after stripping the platform domain (on free hosting) or the www."""
     hostname = urlparse(url).hostname or ''
 
-    # on free hosting, measure the attacker's chosen name, not "www" or the platform
     matched_base = next(
         (base for base in FREE_HOSTING_DOMAINS
          if hostname == base or hostname.endswith('.' + base)),
@@ -189,6 +194,13 @@ def subdomain_entropy(url):
     else:
         target = hostname.split('.')[0]
 
+    return target
+
+
+def subdomain_entropy(url):
+    """Scores how random the chosen subdomain looks. Phishing kits generate junk
+    like '3ib64a1sok-k9t7f7se' — real words score low, gibberish scores high."""
+    target = split_subdomain_target(url)
     if not target:
         return 0.0
 
@@ -225,6 +237,11 @@ def extract_features(url, soup):
     features['uses_https'] = parsed.scheme == 'https'
     features['has_ip_as_domain'] = hostname_is_ip(parsed.hostname)
     features['on_free_hosting'] = is_on_free_hosting(url)
+    features['has_suspicious_keyword'] = any(
+        k in url.lower() for k in SUSPICIOUS_KEYWORDS
+    )
+    subdomain_target = split_subdomain_target(url)
+    features['subdomain_length'] = len(subdomain_target)
     features['subdomain_entropy'] = round(subdomain_entropy(url), 2)
 
     if soup:
@@ -312,31 +329,49 @@ def _get_domain_age_whois(domain):
 
 
 def rule_based_score(features, domain_age_days):
-    """The simple point system — higher means more suspicious."""
+    """The simple point system. Returns (score, reasons) so you can see
+    exactly which rules fired instead of guessing why a URL scored what it did."""
     score = 0
+    reasons = []
+
+    def add(points, why):
+        nonlocal score
+        score += points
+        if points:
+            reasons.append(f"+{points} {why}")
 
     if not features['uses_https']:
-        score += 1
+        add(1, "no HTTPS")
     if features['has_ip_as_domain']:
-        score += 2
+        add(2, "IP used as domain")
     if features['has_at_symbol']:
-        score += 2
+        add(2, "'@' in URL")
+    if not features['fetch_succeeded']:
+        # an unreachable page isn't "safe" — it's unverifiable
+        add(1, "page unreachable (unverifiable)")
+    if features['has_suspicious_keyword']:
+        add(2, "suspicious keyword in URL")
     if features['form_posts_externally']:
-        score += 3
+        add(3, "form posts to another host")
+    if features['has_password_field']:
+        add(1, "password field present")
     if features['has_password_field'] and features['form_posts_externally']:
-        score += 2
+        add(2, "password field + external form")
     if features['on_free_hosting']:
-        score += 3
-    if features['subdomain_entropy'] >= 3.5:
-        score += 3
-
-    # only trust "old domain = safe" off free hosting — the platform's
-    # age doesn't tell us anything about the attacker's page there
+        add(2, "free hosting")
+    # entropy alone climbs with word length, so it only counts for long targets —
+    # this catches gibberish like "3ib64a1sok" without flagging real long words
+    if features['subdomain_entropy'] >= 3.0 and features['subdomain_length'] >= 10:
+        add(2, "gibberish subdomain")
+    # only trust domain age off free hosting — the platform's age says
+    # nothing about the attacker's page there
     if not features['on_free_hosting']:
-        if domain_age_days is not None and domain_age_days < 30:
-            score += 3
+        if domain_age_days is None:
+            add(1, "no registration record found")
+        elif domain_age_days < 30:
+            add(3, "domain under 30 days old")
 
-    return score
+    return score, reasons
 
 
 def analyze_url(url):
@@ -346,7 +381,10 @@ def analyze_url(url):
 
     features['domain_age_days'] = domain_age_days
     features['domain_age_known'] = int(domain_age_days is not None)
-    features['risk_score'] = rule_based_score(features, domain_age_days)
+
+    score, reasons = rule_based_score(features, domain_age_days)
+    features['risk_score'] = score
+    features['risk_reasons'] = "; ".join(reasons)
 
     return features
 
@@ -423,6 +461,15 @@ if __name__ == '__main__':
         avg_phishing = sum(phishing_scores) / len(phishing_scores)
         avg_legit = sum(legit_scores) / len(legit_scores)
         print(f"\nAverage risk score — phishing: {avg_phishing:.2f} | legit: {avg_legit:.2f}")
+
+    # show the score breakdown for anything that scored oddly, so the
+    # rule set can be tuned with evidence instead of guesswork
+    print("\n--- Score breakdown ---")
+    for r in sorted(dataset, key=lambda x: x['risk_score']):
+        if r['risk_score'] == 0 or r['risk_reasons']:
+            label = "PHISHING" if r['label'] == 1 else "LEGIT"
+            why = r['risk_reasons'] or "no rules fired"
+            print(f"[{label:8}] {r['risk_score']:3}  {r['url']}\n           -> {why}")
 
     save_to_csv(dataset, "labeled_dataset.csv")
     save_to_excel(dataset, "labeled_dataset.xlsx")
