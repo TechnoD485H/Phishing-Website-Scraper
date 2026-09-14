@@ -1,7 +1,13 @@
+"""
+Fetches URLs, extracts phishing signals, and builds a labeled dataset.
+Run this first, then train_model.py.
+"""
+
 import requests
 import csv
 import math
 import ipaddress
+import threading
 from collections import Counter
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,8 +22,7 @@ except ImportError:
 
 try:
     import tldextract  # pip install tldextract
-    # skip tldextract's online update check — use its bundled offline list,
-    # which is plenty accurate and means this doesn't depend on network access
+    # offline list only, so it never needs network access
     _tld_extractor = tldextract.TLDExtract(suffix_list_urls=())
 except ImportError:
     tldextract = None
@@ -31,9 +36,22 @@ except ImportError:
     print("pandas not installed — skipping Excel export. (pip install pandas openpyxl)")
 
 
-# ---------------------------------------------------------
-# Test data
-# ---------------------------------------------------------
+# Each thread needs its own session — requests.Session isn't thread-safe,
+# and sharing one across workers causes random connection errors.
+_thread_local = threading.local()
+
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0 Safari/537.36")
+
+
+def get_session():
+    if not hasattr(_thread_local, "session"):
+        s = requests.Session()
+        s.headers.update({"User-Agent": USER_AGENT})
+        _thread_local.session = s
+    return _thread_local.session
+
 
 def load_openphish_urls(limit=10, timeout=10):
     """Grabs a batch of currently-active phishing URLs from OpenPhish's free feed."""
@@ -101,12 +119,8 @@ LEGIT_TEST_URLS = [
 ]
 
 
-# ---------------------------------------------------------
-# Don't let the scraper touch private/internal IPs
-# ---------------------------------------------------------
-
 def is_private_or_local(url):
-    """True if a URL points at your own network (router, localhost, etc.) instead of the real internet."""
+    """Keeps the scraper away from localhost, routers, and internal networks."""
     hostname = urlparse(url).hostname
     if not hostname:
         return True
@@ -114,15 +128,22 @@ def is_private_or_local(url):
         ip = ipaddress.ip_address(hostname)
         return ip.is_private or ip.is_loopback or ip.is_link_local
     except ValueError:
-        return False  # just a normal domain name
+        return False  # it's a domain name, not an IP
 
 
-# ---------------------------------------------------------
-# Stop scraped text from becoming a spreadsheet formula
-# ---------------------------------------------------------
+def hostname_is_ip(hostname):
+    """True for raw IPv4 or IPv6 addresses."""
+    if not hostname:
+        return False
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        return False
+
 
 def sanitize_for_spreadsheet(value):
-    """A string starting with =, +, -, or @ can run as a formula in Excel — this defangs it."""
+    """Stops Excel from running a cell as a formula if it starts with =, +, - or @."""
     if isinstance(value, str) and value and value[0] in ('=', '+', '-', '@'):
         return "'" + value
     return value
@@ -132,13 +153,9 @@ def sanitize_row(row):
     return {key: sanitize_for_spreadsheet(value) for key, value in row.items()}
 
 
-# ---------------------------------------------------------
-# Free-hosting detection
-# ---------------------------------------------------------
-# Lots of phishing pages live on free platforms like Weebly or Azure.
-# The platform's domain being old doesn't mean the attacker's page is —
-# so we flag this directly instead of trusting domain age here.
-
+# Phishing pages love free platforms (Netlify, GitHub Pages, etc.). An old
+# platform domain says nothing about the attacker's page, so we flag these
+# directly instead of trusting domain age.
 FREE_HOSTING_DOMAINS = [
     'weebly.com', 'pages.dev', 'gitbook.io', 'azurefd.net',
     'cloudclusters.net', 'amplifyapp.com', 'godaddysites.com',
@@ -153,18 +170,12 @@ def is_on_free_hosting(url):
     return any(hostname == d or hostname.endswith('.' + d) for d in FREE_HOSTING_DOMAINS)
 
 
-# ---------------------------------------------------------
-# How random does the subdomain look?
-# ---------------------------------------------------------
-# Phishing kits often generate gibberish subdomains like
-# "3ib64a1sok-k9t7f7se". Shannon entropy scores how random a
-# string looks — real words score low, generated junk scores high.
-
 def subdomain_entropy(url):
+    """Scores how random the subdomain looks. Phishing kits generate junk like
+    '3ib64a1sok-k9t7f7se' — real words score low, gibberish scores high."""
     hostname = urlparse(url).hostname or ''
 
-    # on free hosting, look past the platform's own domain so we're
-    # measuring what the attacker actually chose, not "www"
+    # on free hosting, measure the attacker's chosen name, not "www" or the platform
     matched_base = next(
         (base for base in FREE_HOSTING_DOMAINS
          if hostname == base or hostname.endswith('.' + base)),
@@ -186,18 +197,14 @@ def subdomain_entropy(url):
     return -sum((count / length) * math.log2(count / length) for count in counts.values())
 
 
-# ---------------------------------------------------------
-# Fetch, extract features, score
-# ---------------------------------------------------------
-
-def fetch_page(session, url, timeout=5):
-    """Fetches and parses a page. Skips it if unreachable or somewhere we shouldn't go."""
+def fetch_page(url, timeout=5):
+    """Downloads and parses a page. Returns None if it's unreachable or off-limits."""
     if is_private_or_local(url):
         print(f"Skipping {url} — points to a private/internal address")
         return None
 
     try:
-        response = session.get(url, timeout=timeout)
+        response = get_session().get(url, timeout=timeout)
         response.raise_for_status()
     except requests.RequestException as e:
         print(f"Could not fetch {url}: {e}")
@@ -206,18 +213,17 @@ def fetch_page(session, url, timeout=5):
 
 
 def extract_features(url, soup):
-    """Pulls out the signals we use to judge whether a page looks like phishing."""
+    """Turns a page into the signals we judge it on."""
     parsed = urlparse(url)
     features = {"url": url}
 
+    features['fetch_succeeded'] = soup is not None
     features['url_length'] = len(url)
     features['num_dots'] = url.count('.')
     features['num_hyphens'] = url.count('-')
     features['has_at_symbol'] = '@' in url
     features['uses_https'] = parsed.scheme == 'https'
-    features['has_ip_as_domain'] = bool(
-        parsed.hostname and parsed.hostname.replace('.', '').isdigit()
-    )
+    features['has_ip_as_domain'] = hostname_is_ip(parsed.hostname)
     features['on_free_hosting'] = is_on_free_hosting(url)
     features['subdomain_entropy'] = round(subdomain_entropy(url), 2)
 
@@ -226,18 +232,15 @@ def extract_features(url, soup):
         features['num_forms'] = len(forms)
         features['has_password_field'] = bool(soup.find('input', {'type': 'password'}))
 
-        # does any form send its data to a genuinely different site?
-        # compare registrable domains, not exact hostnames — a form
-        # going from www.example.com to accounts.example.com is the
-        # same real site, not a red flag
-        page_domain = get_registrable_domain(parsed.netloc)
+        # flag any form that ships its data to a different host — this catches
+        # phishing pages that harvest credentials for someone else's server,
+        # including protocol-relative actions like "//evil.com/submit"
+        page_host = parsed.hostname
         external_form = False
         for form in forms:
-            action = form.get('action', '')
-            if action.startswith('http'):
-                action_domain = get_registrable_domain(urlparse(action).netloc)
-                if action_domain != page_domain:
-                    external_form = True
+            action_host = urlparse(form.get('action', '')).hostname
+            if action_host and action_host != page_host:
+                external_form = True
         features['form_posts_externally'] = external_form
     else:
         features['num_forms'] = 0
@@ -248,11 +251,7 @@ def extract_features(url, soup):
 
 
 def get_registrable_domain(hostname):
-    """
-    Pulls out the actual domain a WHOIS server would recognize —
-    e.g. "blog.mail.co.uk" -> "mail.co.uk", "www.airbnb.com" -> "airbnb.com".
-    Falls back to a plain www-strip if tldextract isn't installed.
-    """
+    """The domain a WHOIS server would recognize: 'blog.mail.co.uk' -> 'mail.co.uk'."""
     if _tld_extractor is not None:
         ext = _tld_extractor(hostname)
         if ext.domain and ext.suffix:
@@ -261,8 +260,7 @@ def get_registrable_domain(hostname):
 
 
 def get_domain_age_days(url):
-    """How old is this domain? Tries RDAP first (structured, reliable),
-    falls back to WHOIS if RDAP doesn't have an answer."""
+    """How old the domain is, in days. Tries RDAP first, falls back to WHOIS."""
     if is_private_or_local(url):
         return None
 
@@ -276,8 +274,7 @@ def get_domain_age_days(url):
 
 
 def _get_domain_age_rdap(domain, timeout=6):
-    """RDAP is the structured, JSON-based successor to WHOIS — much less
-    prone to misreading the wrong date than scraping raw WHOIS text."""
+    # RDAP is the modern JSON replacement for WHOIS — much easier to parse reliably
     try:
         response = requests.get(f"https://rdap.org/domain/{domain}", timeout=timeout)
         response.raise_for_status()
@@ -297,7 +294,7 @@ def _get_domain_age_rdap(domain, timeout=6):
 
 
 def _get_domain_age_whois(domain):
-    """Fallback for domains RDAP doesn't cover. Less reliable — see get_domain_age_days."""
+    """Fallback when RDAP has no answer. Less reliable, but better than nothing."""
     if whois is None:
         return None
     try:
@@ -315,7 +312,7 @@ def _get_domain_age_whois(domain):
 
 
 def rule_based_score(features, domain_age_days):
-    """Simple point system — higher means more suspicious. Our baseline before ML."""
+    """The simple point system — higher means more suspicious."""
     score = 0
 
     if not features['uses_https']:
@@ -342,43 +339,34 @@ def rule_based_score(features, domain_age_days):
     return score
 
 
-def analyze_url(session, url):
-    soup = fetch_page(session, url)
+def analyze_url(url):
+    soup = fetch_page(url)
     features = extract_features(url, soup)
     domain_age_days = get_domain_age_days(url)
 
     features['domain_age_days'] = domain_age_days
+    features['domain_age_known'] = int(domain_age_days is not None)
     features['risk_score'] = rule_based_score(features, domain_age_days)
 
     return features
 
 
 def analyze_urls(urls, max_workers=5):
-    """Runs analyze_url() across a list of URLs at once."""
+    """Analyzes a list of URLs in parallel."""
     results = []
-    with requests.Session() as session:
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/124.0 Safari/537.36"
-        })
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_url = {executor.submit(analyze_url, session, url): url for url in urls}
-            for future in as_completed(future_to_url):
-                url = future_to_url[future]
-                try:
-                    results.append(future.result())
-                except Exception as e:
-                    print(f"Failed to analyze {url}: {e}")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_url = {executor.submit(analyze_url, url): url for url in urls}
+        for future in as_completed(future_to_url):
+            url = future_to_url[future]
+            try:
+                results.append(future.result())
+            except Exception as e:
+                print(f"Failed to analyze {url}: {e}")
     return results
 
 
-# ---------------------------------------------------------
-# Build a labeled dataset for training the ML model
-# ---------------------------------------------------------
-
 def build_labeled_dataset(phishing_urls, legit_urls, max_workers=5):
-    """Runs everything and tags each row 1 (phishing) or 0 (legit) based on which list it came from."""
+    """Tags every row: 1 = phishing, 0 = legit, depending on which list it came from."""
     phishing_set = set(phishing_urls)
     all_urls = list(phishing_urls) + list(legit_urls)
     results = analyze_urls(all_urls, max_workers=max_workers)
@@ -388,10 +376,6 @@ def build_labeled_dataset(phishing_urls, legit_urls, max_workers=5):
 
     return results
 
-
-# ---------------------------------------------------------
-# Export
-# ---------------------------------------------------------
 
 def save_to_csv(rows, filename='phishing_features.csv', fieldnames=None):
     if not rows:

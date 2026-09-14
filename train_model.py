@@ -1,8 +1,7 @@
 """
 Trains a classifier on labeled_dataset.csv (produced by phishing_detector.py)
 and compares it against the hand-built rule_based_score() baseline.
-
-Run phishing_detector.py first to generate the dataset, then run this.
+Run phishing_detector.py first, then this.
 """
 
 import pandas as pd
@@ -13,6 +12,7 @@ import joblib
 
 
 FEATURE_COLUMNS = [
+    'fetch_succeeded',
     'url_length',
     'num_dots',
     'num_hyphens',
@@ -24,10 +24,9 @@ FEATURE_COLUMNS = [
     'num_forms',
     'has_password_field',
     'form_posts_externally',
+    'domain_age_days',    # NaN-filled with -1 during load
+    'domain_age_known',   # 1 if we got a real registration date, 0 if not
 ]
-# domain_age_days is left out on purpose — it's often missing for phishing
-# URLs (free hosting, WHOIS privacy), and scikit-learn can't handle NaN
-# directly. Fill it with a placeholder like -1 first if you want to try it.
 
 
 def load_dataset(filename='labeled_dataset.csv'):
@@ -35,6 +34,18 @@ def load_dataset(filename='labeled_dataset.csv'):
     missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"Dataset is missing expected columns: {missing}")
+
+    # sklearn can't handle NaN. We fill missing ages with -1 AND keep a
+    # separate flag, so the model can tell "brand new domain" apart from
+    # "no record found at all" — those are very different things.
+    df['domain_age_days'] = df['domain_age_days'].fillna(-1)
+
+    # older CSVs won't have these — backfill sensible defaults
+    if 'fetch_succeeded' not in df.columns:
+        df['fetch_succeeded'] = 1
+    if 'domain_age_known' not in df.columns:
+        df['domain_age_known'] = (df['domain_age_days'] != -1).astype(int)
+
     return df
 
 
@@ -49,6 +60,12 @@ def train_and_evaluate(df, test_size=0.3, random_state=42):
             "\nHeads up — this dataset is pretty small for ML. Treat these "
             "numbers as a first look, not a reliable result. Bump up the "
             "OpenPhish limit in phishing_detector.py and re-run to get more data."
+        )
+
+    if y.min() == y.max():
+        raise ValueError(
+            "Dataset only contains one class — can't train a classifier. "
+            "Check that labeled_dataset.csv has both phishing and legit rows."
         )
 
     X_train, X_test, y_train, y_test = train_test_split(
@@ -75,39 +92,40 @@ def train_and_evaluate(df, test_size=0.3, random_state=42):
     print(importances.sort_values(ascending=False).round(3))
 
     print("\n--- Any URLs the model got wrong ---")
-    mismatched = y_test.index[y_test.values != y_pred]
+    y_pred_series = pd.Series(y_pred, index=y_test.index)
+    mismatched = y_test[y_test != y_pred_series]
     if len(mismatched) == 0:
         print("None — perfect score on the test set.")
     else:
-        for idx in mismatched:
+        for idx in mismatched.index:
             actual_label = "phishing" if y_test.loc[idx] == 1 else "legit"
-            predicted_label = "phishing" if y_pred[list(y_test.index).index(idx)] == 1 else "legit"
+            predicted_label = "phishing" if y_pred_series.loc[idx] == 1 else "legit"
             print(f"  {df.loc[idx, 'url']}  (actual: {actual_label}, predicted: {predicted_label})")
 
-    return model, X_test, y_test
+    return model, X_test, y_test, y_pred
 
 
-def compare_to_rule_based_baseline(df, threshold=5):
-    """How well would the original point-based scorer alone have done?"""
-    predicted = (df['risk_score'] >= threshold).astype(int)
-    actual = df['label']
+def compare_to_rule_based_baseline(df_test, threshold=5):
+    """Scores the old point-based system on the SAME test rows the model saw,
+    so the comparison is fair."""
+    predicted = (df_test['risk_score'] >= threshold).astype(int)
+    actual = df_test['label']
 
-    print(f"\n--- Rule-based baseline (risk_score >= {threshold} = phishing) ---")
+    print(f"\n--- Rule-based baseline (risk_score >= {threshold} = phishing), on the test set ---")
     print(classification_report(actual, predicted, target_names=['legit', 'phishing']))
 
 
 if __name__ == '__main__':
     df = load_dataset('labeled_dataset.csv')
 
-    print("=" * 70)
-    print("RULE-BASED BASELINE")
-    print("=" * 70)
-    compare_to_rule_based_baseline(df)
+    model, X_test, y_test, y_pred = train_and_evaluate(df)
+
+    df_test = df.loc[X_test.index]
 
     print("\n" + "=" * 70)
-    print("MACHINE LEARNING MODEL")
+    print("RULE-BASED BASELINE (same test set)")
     print("=" * 70)
-    model, X_test, y_test = train_and_evaluate(df)
+    compare_to_rule_based_baseline(df_test)
 
     joblib.dump(model, 'phishing_model.joblib')
     print("\nModel saved to phishing_model.joblib")
