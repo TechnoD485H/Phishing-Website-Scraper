@@ -3,7 +3,6 @@ Shows exactly what RDAP and WHOIS each return for a domain, with no
 processing applied — so we can see precisely which one is giving bad
 data instead of guessing.
 
-Usage: python3 debug_domain_age.py airbnb.com
 """
 
 import sys
