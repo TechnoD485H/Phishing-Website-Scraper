@@ -351,12 +351,19 @@ def rule_based_score(features, domain_age_days):
         add(1, "page unreachable (unverifiable)")
     if features['has_suspicious_keyword']:
         add(2, "suspicious keyword in URL")
-    if features['form_posts_externally']:
-        add(3, "form posts to another host")
-    if features['has_password_field']:
-        add(1, "password field present")
-    if features['has_password_field'] and features['form_posts_externally']:
-        add(2, "password field + external form")
+
+    # An external form only really matters if it's also asking for a
+    # password — that's the actual credential-harvesting pattern. Plenty
+    # of legit sites embed third-party widgets (newsletter signup, chat,
+    # cookie consent) that post off-site and have nothing to do with
+    # credentials, so those get a much smaller nudge instead of the full
+    # penalty. A bare password field with no external posting is normal
+    # (every login page has one) so it no longer scores on its own.
+    if features['form_posts_externally'] and features['has_password_field']:
+        add(4, "password field + external form (credential harvesting pattern)")
+    elif features['form_posts_externally']:
+        add(1, "form posts to another host")
+
     if features['on_free_hosting']:
         add(2, "free hosting")
     # entropy alone climbs with word length, so it only counts for long targets —
@@ -364,11 +371,12 @@ def rule_based_score(features, domain_age_days):
     if features['subdomain_entropy'] >= 3.0 and features['subdomain_length'] >= 10:
         add(2, "gibberish subdomain")
     # only trust domain age off free hosting — the platform's age says
-    # nothing about the attacker's page there
+    # nothing about the attacker's page there. An unknown/failed lookup is
+    # NOT penalized — RDAP/WHOIS can fail for perfectly legitimate domains
+    # too (rate limits, slow registrars), so treating "unknown" the same
+    # as "suspicious" just adds noise.
     if not features['on_free_hosting']:
-        if domain_age_days is None:
-            add(1, "no registration record found")
-        elif domain_age_days < 30:
+        if domain_age_days is not None and domain_age_days < 30:
             add(3, "domain under 30 days old")
 
     return score, reasons
