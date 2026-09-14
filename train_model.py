@@ -1,18 +1,18 @@
 """
-Trains a classifier on labeled_dataset.csv (produced by phishing_detector.py)
+Trains a classifier on labeled_dataset.csv (produced by phishing_scraper.py)
 and compares it against the hand-built rule_based_score() baseline.
-Run phishing_detector.py first, then this.
+
+Run phishing_scraper.py first to generate the dataset, then run this.
 """
 
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, confusion_matrix
 import joblib
 
 
 FEATURE_COLUMNS = [
-    'fetch_succeeded',
     'url_length',
     'num_dots',
     'num_hyphens',
@@ -26,34 +26,22 @@ FEATURE_COLUMNS = [
     'num_forms',
     'has_password_field',
     'form_posts_externally',
-    'domain_age_days',    # NaN-filled with -1 during load
-    'domain_age_known',   # 1 if we got a real registration date, 0 if not
+    'fetch_succeeded',
+    'domain_age_known',
 ]
+# domain_age_days itself is left out — it's often missing (None) for real
+# phishing URLs, and scikit-learn can't handle NaN directly. domain_age_known
+# (whether we got an answer at all) is included instead as a cheap stand-in.
 
 
 def load_dataset(filename='labeled_dataset.csv'):
     df = pd.read_csv(filename)
     missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
     if missing:
-        raise ValueError(f"Dataset is missing expected columns: {missing}")
-
-    # sklearn can't handle NaN. We fill missing ages with -1 AND keep a
-    # separate flag, so the model can tell "brand new domain" apart from
-    # "no record found at all" — those are very different things.
-    df['domain_age_days'] = df['domain_age_days'].fillna(-1)
-
-    # older CSVs won't have these — backfill sensible defaults
-    if 'fetch_succeeded' not in df.columns:
-        df['fetch_succeeded'] = 1
-    if 'domain_age_known' not in df.columns:
-        df['domain_age_known'] = (df['domain_age_days'] != -1).astype(int)
-    if 'has_suspicious_keyword' not in df.columns:
-        df['has_suspicious_keyword'] = 0
-    if 'subdomain_length' not in df.columns:
-        df['subdomain_length'] = df['url'].map(
-            lambda u: len((u.split('//')[-1].split('/')[0].split('.') or [''])[0])
+        raise ValueError(
+            f"Dataset is missing expected columns: {missing}\n"
+            f"Did you run the latest phishing_scraper.py before this?"
         )
-
     return df
 
 
@@ -67,18 +55,30 @@ def train_and_evaluate(df, test_size=0.3, random_state=42):
         print(
             "\nHeads up — this dataset is pretty small for ML. Treat these "
             "numbers as a first look, not a reliable result. Bump up the "
-            "OpenPhish limit in phishing_detector.py and re-run to get more data."
-        )
-
-    if y.min() == y.max():
-        raise ValueError(
-            "Dataset only contains one class — can't train a classifier. "
-            "Check that labeled_dataset.csv has both phishing and legit rows."
+            "OpenPhish limit in phishing_scraper.py and re-run to get more data."
         )
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
     )
+
+    # A single train/test split can look perfect by luck, especially on a
+    # dataset this size. 5-fold cross-validation trains/tests on 5 different
+    # splits and reports the spread — a much more trustworthy signal than
+    # one number. If this varies a lot, or sits meaningfully below the
+    # single-split score above, that's overfitting showing itself.
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+    cv_scores = cross_val_score(
+        RandomForestClassifier(n_estimators=200, random_state=random_state),
+        X, y, cv=cv, scoring='f1'
+    )
+    print(f"\n--- 5-fold cross-validation (F1 score per fold) ---")
+    print(f"Folds: {[round(s, 3) for s in cv_scores]}")
+    print(f"Mean: {cv_scores.mean():.3f}  |  Std dev: {cv_scores.std():.3f}")
+    if cv_scores.std() > 0.05:
+        print("Noticeable spread across folds — treat the single-split result with caution.")
+    elif cv_scores.mean() < 0.95:
+        print("Consistently below-perfect across folds — a more honest generalization estimate than one split.")
 
     model = RandomForestClassifier(n_estimators=200, random_state=random_state)
     model.fit(X_train, y_train)
@@ -100,42 +100,42 @@ def train_and_evaluate(df, test_size=0.3, random_state=42):
     print(importances.sort_values(ascending=False).round(3))
 
     print("\n--- Any URLs the model got wrong ---")
-    y_pred_series = pd.Series(y_pred, index=y_test.index)
-    mismatched = y_test[y_test != y_pred_series]
+    mismatched = y_test.index[y_test.values != y_pred]
     if len(mismatched) == 0:
         print("None — perfect score on the test set.")
     else:
-        for idx in mismatched.index:
+        for idx in mismatched:
             actual_label = "phishing" if y_test.loc[idx] == 1 else "legit"
-            predicted_label = "phishing" if y_pred_series.loc[idx] == 1 else "legit"
-            reasons = df.loc[idx, 'risk_reasons'] if 'risk_reasons' in df.columns else 'n/a'
+            predicted_label = "phishing" if y_pred[list(y_test.index).index(idx)] == 1 else "legit"
+            reasons = df.loc[idx, 'risk_reasons'] if 'risk_reasons' in df.columns else ""
             print(f"  {df.loc[idx, 'url']}  (actual: {actual_label}, predicted: {predicted_label})")
-            print(f"      rule-based reasons: {reasons}")
+            if reasons:
+                print(f"    rule-based reasons: {reasons}")
 
-    return model, X_test, y_test, y_pred
+    return model, X_test, y_test
 
 
-def compare_to_rule_based_baseline(df_test, threshold=4):
-    """Scores the old point-based system on the SAME test rows the model saw,
-    so the comparison is fair."""
-    predicted = (df_test['risk_score'] >= threshold).astype(int)
-    actual = df_test['label']
+def compare_to_rule_based_baseline(df, threshold=2):
+    """How well would the original point-based scorer alone have done?"""
+    predicted = (df['risk_score'] >= threshold).astype(int)
+    actual = df['label']
 
-    print(f"\n--- Rule-based baseline (risk_score >= {threshold} = phishing), on the test set ---")
+    print(f"\n--- Rule-based baseline (risk_score >= {threshold} = phishing) ---")
     print(classification_report(actual, predicted, target_names=['legit', 'phishing']))
 
 
 if __name__ == '__main__':
     df = load_dataset('labeled_dataset.csv')
 
-    model, X_test, y_test, y_pred = train_and_evaluate(df)
-
-    df_test = df.loc[X_test.index]
+    print("=" * 70)
+    print("RULE-BASED BASELINE")
+    print("=" * 70)
+    compare_to_rule_based_baseline(df)
 
     print("\n" + "=" * 70)
-    print("RULE-BASED BASELINE (same test set)")
+    print("MACHINE LEARNING MODEL")
     print("=" * 70)
-    compare_to_rule_based_baseline(df_test)
+    model, X_test, y_test = train_and_evaluate(df)
 
     joblib.dump(model, 'phishing_model.joblib')
     print("\nModel saved to phishing_model.joblib")
