@@ -162,6 +162,8 @@ FREE_HOSTING_DOMAINS = [
     'netlify.app', 'vercel.app', 'herokuapp.com', '000webhostapp.com',
     'github.io', 'firebaseapp.com', 'web.app', 'wixsite.com',
     'blogspot.com', 'sites.google.com', 'repl.co', 'glitch.me',
+    'replit.app', 'edgeone.dev', 'laravel.cloud', 'wasmer.app',
+    'typedream.app', 'flutterflow.app', 'workers.dev', 'staticdomains.app',
 ]
 
 # Classic bait words phishing URLs dangle in paths and subdomains.
@@ -169,6 +171,132 @@ SUSPICIOUS_KEYWORDS = [
     'login', 'verify', 'secure', 'account', 'update',
     'confirm', 'banking', 'signin', 'support', 'wallet',
 ]
+
+# Brands commonly impersonated by phishing kits. Kept separate from
+# LEGIT_TEST_URLS since this list exists to catch IMPERSONATION, not to
+# describe our test data.
+# Brands commonly targeted by phishing, mapped to their REAL suffix — not
+# every legitimate brand uses .com (python.org, zoom.us, twitch.tv are all
+# genuinely correct), so "wrong TLD" has to be checked per-brand, not
+# assumed universally.
+PHISHING_TARGET_BRAND_SUFFIXES = {
+    'google': 'com', 'microsoft': 'com', 'apple': 'com', 'amazon': 'com',
+    'paypal': 'com', 'netflix': 'com', 'facebook': 'com', 'instagram': 'com',
+    'twitter': 'com', 'linkedin': 'com', 'roblox': 'com', 'chase': 'com',
+    'wellsfargo': 'com', 'bankofamerica': 'com', 'dropbox': 'com', 'adobe': 'com',
+    'ebay': 'com', 'airbnb': 'com', 'uber': 'com', 'spotify': 'com',
+    'wordpress': 'com', 'github': 'com', 'coinbase': 'com', 'trustwallet': 'com',
+    'dhl': 'com', 'fedex': 'com', 'ups': 'com', 'usps': 'com', 'meta': 'com',
+    'exodus': 'com', 'phantom': 'app', 'binance': 'com',
+}
+
+
+def _build_known_brand_suffixes():
+    """Combines the curated phishing-target brands above with the actual,
+    verified suffixes of our own legit test sites — those are authoritative
+    since we know their real URLs directly, so they override any guess."""
+    suffixes = dict(PHISHING_TARGET_BRAND_SUFFIXES)
+    if _tld_extractor is not None:
+        for url in LEGIT_TEST_URLS:
+            hostname = urlparse(url).hostname
+            ext = _tld_extractor(hostname)
+            if ext.domain:
+                suffixes[ext.domain] = ext.suffix
+    return suffixes
+
+
+KNOWN_BRAND_SUFFIXES = _build_known_brand_suffixes()
+KNOWN_BRANDS = list(KNOWN_BRAND_SUFFIXES.keys())
+
+
+def levenshtein_distance(a, b):
+    """How many single-character edits turn string a into string b.
+    0 = identical, 1-2 = a likely typo, larger = probably unrelated."""
+    if a == b:
+        return 0
+    if len(a) < len(b):
+        a, b = b, a
+
+    previous_row = range(len(b) + 1)
+    for i, char_a in enumerate(a):
+        current_row = [i + 1]
+        for j, char_b in enumerate(b):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (char_a != char_b)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    return previous_row[-1]
+
+
+def check_brand_impersonation(url):
+    """
+    Looks for a known brand being impersonated. Two different checks,
+    depending on where the site is hosted:
+
+    - On free hosting (Vercel, GitHub Pages, etc.): the platform's own
+      domain name is meaningless — anyone can have a github.io page, and
+      that alone doesn't mean they're impersonating GitHub. What matters
+      is whether the ATTACKER-CHOSEN subdomain (e.g. "securebankofamerica"
+      in securebankofamerica.vercel.app) contains or closely resembles a
+      known brand.
+    - Off free hosting: the registrable domain itself is what matters —
+      either it's the exact brand name on a suffix that isn't the brand's
+      real one, or it's a close misspelling of the brand.
+
+    Returns (matched_brand, edit_distance, is_impersonating).
+    """
+    if is_on_free_hosting(url):
+        target = split_subdomain_target(url).lower()
+        if not target:
+            return None, None, False
+
+        # a brand name showing up anywhere inside the chosen subdomain
+        # (e.g. "instagram" inside "open-instagram") is worth flagging
+        # outright — length 4+ avoids matching on noise
+        for brand in KNOWN_BRANDS:
+            if len(brand) >= 4 and brand in target:
+                return brand, 0, True
+
+        best_brand, best_distance = None, None
+        for brand in KNOWN_BRANDS:
+            distance = levenshtein_distance(target, brand)
+            if best_distance is None or distance < best_distance:
+                best_brand, best_distance = brand, distance
+
+        close_typo = best_distance is not None and 0 < best_distance <= 2
+        return best_brand, best_distance, close_typo
+
+    if _tld_extractor is None:
+        return None, None, False
+
+    ext = _tld_extractor(urlparse(url).hostname or '')
+    domain = (ext.domain or '').lower()
+    suffix = ext.suffix or ''
+
+    if not domain:
+        return None, None, False
+
+    # if the domain is itself an exact match for a known brand, it's that
+    # brand's real identity (or genuinely a different, unrelated company —
+    # e.g. "shopify" vs "spotify" — not an impersonation attempt) — the
+    # only thing worth flagging is if it's using a suffix that ISN'T that
+    # brand's actual real one
+    if domain in KNOWN_BRAND_SUFFIXES:
+        real_suffix = KNOWN_BRAND_SUFFIXES[domain]
+        return domain, 0, (suffix != real_suffix)
+
+    best_brand, best_distance = None, None
+    for brand in KNOWN_BRANDS:
+        distance = levenshtein_distance(domain, brand)
+        if best_distance is None or distance < best_distance:
+            best_brand, best_distance = brand, distance
+
+    if best_distance is None:
+        return None, None, False
+
+    close_typo = (0 < best_distance <= 2)
+    return best_brand, best_distance, close_typo
 
 
 def is_on_free_hosting(url):
@@ -243,6 +371,11 @@ def extract_features(url, soup):
     subdomain_target = split_subdomain_target(url)
     features['subdomain_length'] = len(subdomain_target)
     features['subdomain_entropy'] = round(subdomain_entropy(url), 2)
+
+    brand, brand_distance, impersonating = check_brand_impersonation(url)
+    features['matched_brand'] = brand or ''
+    features['brand_edit_distance'] = brand_distance if brand_distance is not None else -1
+    features['impersonates_brand'] = impersonating
 
     if soup:
         forms = soup.find_all('form')
@@ -351,6 +484,13 @@ def rule_based_score(features, domain_age_days):
         add(1, "page unreachable (unverifiable)")
     if features['has_suspicious_keyword']:
         add(2, "suspicious keyword in URL")
+    if features['impersonates_brand']:
+        if features['on_free_hosting'] and features['brand_edit_distance'] == 0:
+            add(4, f"brand name '{features['matched_brand']}' found in the subdomain (free hosting)")
+        elif features['brand_edit_distance'] == 0:
+            add(4, f"exact brand name '{features['matched_brand']}' on wrong TLD")
+        else:
+            add(3, f"looks like a typo of '{features['matched_brand']}'")
 
     # An external form only really matters if it's also asking for a
     # password — that's the actual credential-harvesting pattern. Plenty

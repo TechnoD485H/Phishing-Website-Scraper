@@ -28,10 +28,15 @@ FEATURE_COLUMNS = [
     'form_posts_externally',
     'fetch_succeeded',
     'domain_age_known',
+    'brand_edit_distance',
+    'impersonates_brand',
 ]
 # domain_age_days itself is left out — it's often missing (None) for real
 # phishing URLs, and scikit-learn can't handle NaN directly. domain_age_known
 # (whether we got an answer at all) is included instead as a cheap stand-in.
+# matched_brand is text (the brand name itself), not a number, so it's left
+# out too — brand_edit_distance and impersonates_brand already capture what
+# matters about it numerically.
 
 
 def load_dataset(filename='labeled_dataset.csv'):
@@ -124,6 +129,32 @@ def compare_to_rule_based_baseline(df, threshold=2):
     print(classification_report(actual, predicted, target_names=['legit', 'phishing']))
 
 
+def sweep_thresholds(df, thresholds=range(0, 12)):
+    """
+    Tries every threshold instead of guessing one, so you can see the
+    actual precision/recall trade-off and pick a defensible cutoff
+    instead of an arbitrary number.
+    """
+    from sklearn.metrics import precision_score, recall_score, f1_score
+
+    print("\n--- Threshold sweep (risk_score >= T counts as phishing) ---")
+    print(f"{'T':>3} {'precision':>10} {'recall':>8} {'f1':>6}")
+    best_f1, best_t = -1, None
+    for t in thresholds:
+        predicted = (df['risk_score'] >= t).astype(int)
+        actual = df['label']
+        p = precision_score(actual, predicted, zero_division=0)
+        r = recall_score(actual, predicted, zero_division=0)
+        f1 = f1_score(actual, predicted, zero_division=0)
+        marker = ""
+        if f1 > best_f1:
+            best_f1, best_t = f1, t
+            marker = "  <- best F1 so far"
+        print(f"{t:>3} {p:>10.2f} {r:>8.2f} {f1:>6.2f}{marker}")
+    print(f"\nBest single threshold by F1: {best_t} (F1={best_f1:.2f})")
+    return best_t
+
+
 if __name__ == '__main__':
     df = load_dataset('labeled_dataset.csv')
 
@@ -131,6 +162,7 @@ if __name__ == '__main__':
     print("RULE-BASED BASELINE")
     print("=" * 70)
     compare_to_rule_based_baseline(df)
+    sweep_thresholds(df)
 
     print("\n" + "=" * 70)
     print("MACHINE LEARNING MODEL")
